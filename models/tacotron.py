@@ -1,154 +1,460 @@
-import tensorflow as tf
-from tensorflow.contrib.rnn import GRUCell, MultiRNNCell, OutputProjectionWrapper, ResidualWrapper
-from tensorflow.contrib.seq2seq import BasicDecoder, BahdanauAttention, AttentionWrapper
-from text.symbols import symbols
-from util.infolog import log
-from .helpers import TacoTestHelper, TacoTrainingHelper
-from .modules import encoder_cbhg, post_cbhg, prenet
-from .rnn_wrappers import DecoderPrenetWrapper, ConcatOutputAndAttentionWrapper
+import os
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from pathlib import Path
+from typing import Union
+
+class HighwayNetwork(nn.Module):
+    def __init__(self,size):
+        super.__init__()
+        self.W1 = nn.Linear(size,size)
+        self.W2 = nn.Linear(size,size)
+        self.W1.bias.data.fill_(0.)
+
+    def forward(self,x):
+        y = self.W1(x)
+        x2 = self.W2(x)
+        g = torch.sigmoid(x2)
+        return g*(F.relu(y)) + (1.-g)*x
+
+class PreNet(nn.module):
+    def __init__(self,in_dims,fc1_dims=256,fc2_dims=128,dropout=0.5):
+        super.__init__()
+        self.fc1 = nn.Linear(in_dims,fc1_dims)
+        self.fc2 = nn.Linear(fc1_dims,fc2_dims)
+        self.p=dropout
+
+    def forward(self,x):
+        z1 = self.fc1(x)
+        a1 = F.relu(z1)
+        a1 = F.dropout(a1, self.p,training = self.training)
+        z2 = self.fc2(a1)
+        a2 = F.relu(z2)
+        a2 = F.dropout(a2,self.p,training=self.training)
+        return a2
+
+class BatchNormConv(nn.Module):
+    def __init__(self,in_channels,out_channels,kernel_size,relu=True):
+        super.__init__()
+        self.conv = nn.conv1D(in_channels,out_channels,kernel_size,stride=1,padding=kernel//2,bias=False)
+        self.bnorm = nn.BatchNorm1d(out_channels)
+        self.relu = relu
+
+    def forward(self,x):
+        z1 = self.conv(x)
+        a1 = F.relu(z1) if self.relu is True else z1
+        return self.bnorm(a1)
+
+class CBHG(nn.Module):
+    def __init__(self, K, in_channels,channels,proj_channels,num_highways):
+        super.__init__()
+
+        self._to_flatten = []
+
+        self.bank_kernels = [i for i in range(1,K+1)]
+        self.conv1d_bank = nn.ModuleList()
+        for k in self.bank_kernels:
+            conv = BatchNormConv(in_channels,channels,k)
+            self.conv1d_bank.append(conv)
+
+        self.maxpool = nn.MaxPool1d(kernel_size=2,stride=1,padding=1)
+
+        self.conv_project1 = BatchNormConv(len(self.bank_kernels)*channels,proj_channels[0],3)
+        self.conv_project2 = BatchNormConv(proj_channels[0],proj_channels[1],3,relu=False)
+
+        # Fixing the highway input
+
+        if proj_channels[-1] != channels:
+            self.highway_mismatch = True
+            self.pre_highway = nn.Linear(proj_channels[-1],channels,bias=False)
+        else:
+            self.highway_mismatch = False
+
+        self.highways = nn.ModuleList
+
+        for i in range(num_highways):
+            highway = HighwayNetwork(channels)
+            self.highways.append(highway)
+
+        self.rnn = nn.GRU(channels,channels,batch_first=True,bidirectional=True)
+        self._to_flatten.append(self.rnn)
+
+        self._flatten_parameters()
+
+    def forward(self, x):
+        # Although we `_flatten_parameters()` on init, when using DataParallel
+        # the model gets replicated, making it no longer guaranteed that the
+        # weights are contiguous in GPU memory. Hence, we must call it again
+        self._flatten_parameters()
+
+        # Save these for later
+        residual = x
+        seq_len = x.size(-1)
+        conv_bank = []
+
+        # Convolution operations
+        for conv in self.conv1d_bank:
+            c = conv(x)
+            conv_bank.append(c[:,:,:seq_len])
+
+        # Stack along the channel axis
+        conv_bank = torch.cat(conv_bank,dim=1)
+
+        # dump the last padding to fit residual
+        x = self.maxpool(conv_bank)[:,:,:seq_len]
+
+        # Conv1D projections
+        x = self.conv_project1(x)
+        x = self.conv_project2(x)
+
+        # residual Connect
+        x = x + residual
+
+        # Through the highways
+        x = x.transpose(1,2)
+        if self.highway_mismatch is True:
+            x = self.pre_highway(x)
+        for h in self.highways: x = h(x)
+
+        # RNN operation
+        x , _ = self.rnn(x)
+        return x
+
+    def _flatten_parameters(self):
+        [m.flatten_parameters() for m in self._to_flatten]
+
+class Encoder(nn.Module):
+    def __init__(self, embed_dims,num_chars, cbhg_channels, K, num_highways, dropout):
+        super.__init__()
+        self.embedding = nn.Embedding(num_chars,embed_dims)
+        self.pre_net = PreNet(embed_dims)
+        self.cbhg = CBHG(K=K, in_channels=cbhg_channels, channels=cbhg_channels,
+                         proj_channels=[cbhg_channels, cbhg_channels],
+                         num_highways=num_highways)
+
+    def forward(self,x):
+        x = self.embedding(x)
+        x = self.pre_net(x)
+        x.transpose_(1,2)
+        x = self.cbgh(x)
+        return x
+
+class Attention(nn.Module):
+    def __init__(self,attn_dims):
+        super.__init__()
+        self.W = nn.Linear(attn_dims,attn_dims,bias=False)
+        self.v = nn.Linear(attn_dims,1,bias=False)
+
+    def forward(self,encoder_seq_proj,query,t):
+        query_proj = self.W(query).unsqueeze(1)
+
+        # Compute the scores
+        u = self.v(torch.tanh(encoder_seq_proj + query_proj))
+        scores = F.softmax(u,dim=1)
+
+        return scores.transpose(1,2)
+
+class LSA(nn.Module):
+    def __init__(self,attn_dim,kernel_size=31,filters=32):
+        super.__init__()
+        self.conv = nn.Conv1d(2, filters, padding=(kernel_size - 1) // 2, kernel_size=kernel_size, bias=False)
+        self.L = nn.Linear(filters, attn_dim, bias=True)
+        self.W = nn.Linear(attn_dim, attn_dim, bias=True)
+        self.v = nn.Linear(attn_dim, 1, bias=False)
+        self.cumulative = None
+        self.attention = None
+
+    def init_attention(self, encoder_seq_proj):
+        device = next(self.parameters()).device  # use same device as parameters
+        b, t, c = encoder_seq_proj.size()
+        self.cumulative = torch.zeros(b, t, device=device)
+        self.attention = torch.zeros(b, t, device=device)
+
+    def forward(self, encoder_seq_proj, query, t):
+        if t == 0: self.init_attention(encoder_seq_proj)
+
+        processed_query = self.W(query).unsqueeze(1)
+
+        location = torch.cat([self.cumulative.unsqueeze(1), self.attention.unsqueeze(1)], dim=1)
+        processed_loc = self.L(self.conv(location).transpose(1, 2))
+
+        u = self.v(torch.tanh(processed_query + encoder_seq_proj + processed_loc))
+        u = u.squeeze(-1)
+
+        # Smooth Attention
+        scores = torch.sigmoid(u) / torch.sigmoid(u).sum(dim=1, keepdim=True)
+        # scores = F.softmax(u, dim=1)
+        self.attention = scores
+        self.cumulative += self.attention
+
+        return scores.unsqueeze(-1).transpose(1, 2)
+
+class Decoder(nn.Module):
+    # Class variable because its value doesn't change between classes
+    # yet ought to be scoped by class because its a property of a Decoder
+    max_r = 20
+    def __init__(self, n_mels, decoder_dims, lstm_dims,attention = "LSA"):
+        super().__init__()
+        self.register_buffer('r', torch.tensor(1, dtype=torch.int))
+        self.n_mels = n_mels
+        self.prenet = PreNet(n_mels)
+        if(attention=="LSA"):
+            self.attn_net = LSA(decoder_dims)
+        else:
+            self.attn_net = Attention(decoder_dims)
+        self.attn_rnn = nn.GRUCell(decoder_dims + decoder_dims // 2, decoder_dims)
+        self.rnn_input = nn.Linear(2 * decoder_dims, lstm_dims)
+        self.res_rnn1 = nn.LSTMCell(lstm_dims, lstm_dims)
+        self.res_rnn2 = nn.LSTMCell(lstm_dims, lstm_dims)
+        self.mel_proj = nn.Linear(lstm_dims, n_mels * self.max_r, bias=False)
+
+    def zoneout(self, prev, current, p=0.1):
+        device = next(self.parameters()).device  # Use same device as parameters
+        mask = torch.zeros(prev.size(), device=device).bernoulli_(p)
+        return prev * mask + current * (1 - mask)
+
+    def forward(self, encoder_seq, encoder_seq_proj, prenet_in,
+                hidden_states, cell_states, context_vec, t):
+
+        # Need this for reshaping mels
+        batch_size = encoder_seq.size(0)
+
+        # Unpack the hidden and cell states
+        attn_hidden, rnn1_hidden, rnn2_hidden = hidden_states
+        rnn1_cell, rnn2_cell = cell_states
+
+        # PreNet for the Attention RNN
+        prenet_out = self.prenet(prenet_in)
+
+        # Compute the Attention RNN hidden state
+        attn_rnn_in = torch.cat([context_vec, prenet_out], dim=-1)
+        attn_hidden = self.attn_rnn(attn_rnn_in.squeeze(1), attn_hidden)
+
+        # Compute the attention scores
+        scores = self.attn_net(encoder_seq_proj, attn_hidden, t)
+
+        # Dot product to create the context vector
+        context_vec = scores @ encoder_seq
+        context_vec = context_vec.squeeze(1)
+
+        # Concat Attention RNN output w. Context Vector & project
+        x = torch.cat([context_vec, attn_hidden], dim=1)
+        x = self.rnn_input(x)
+
+        # Compute first Residual RNN
+        rnn1_hidden_next, rnn1_cell = self.res_rnn1(x, (rnn1_hidden, rnn1_cell))
+        if self.training:
+            rnn1_hidden = self.zoneout(rnn1_hidden, rnn1_hidden_next)
+        else:
+            rnn1_hidden = rnn1_hidden_next
+        x = x + rnn1_hidden
+
+        # Compute second Residual RNN
+        rnn2_hidden_next, rnn2_cell = self.res_rnn2(x, (rnn2_hidden, rnn2_cell))
+        if self.training:
+            rnn2_hidden = self.zoneout(rnn2_hidden, rnn2_hidden_next)
+        else:
+            rnn2_hidden = rnn2_hidden_next
+        x = x + rnn2_hidden
+
+        # Project Mels
+        mels = self.mel_proj(x)
+        mels = mels.view(batch_size, self.n_mels, self.max_r)[:, :, :self.r]
+        hidden_states = (attn_hidden, rnn1_hidden, rnn2_hidden)
+        cell_states = (rnn1_cell, rnn2_cell)
+
+        return mels, scores, hidden_states, cell_states, context_vec
+
+class Tacotron(nn.Module):
+    def __init__(self, embed_dims, num_chars, encoder_dims, decoder_dims, n_mels, fft_bins, postnet_dims,
+                 encoder_K, lstm_dims, postnet_K, num_highways, dropout, stop_threshold,attention="LSA"):
+        super().__init__()
+        self.n_mels = n_mels
+        self.lstm_dims = lstm_dims
+        self.decoder_dims = decoder_dims
+        self.encoder = Encoder(embed_dims, num_chars, encoder_dims,
+                               encoder_K, num_highways, dropout)
+        self.encoder_proj = nn.Linear(decoder_dims, decoder_dims, bias=False)
+        if(attention=="LSA"):
+            self.decoder = Decoder(n_mels, decoder_dims, lstm_dims)
+        else:
+            self.decoder = Decoder(n_mels, decoder_dims, lstm_dims,attention="attention")
+        self.postnet = CBHG(postnet_K, n_mels, postnet_dims, [256, 80], num_highways)
+        self.post_proj = nn.Linear(postnet_dims * 2, fft_bins, bias=False)
+
+        self.init_model()
+        self.num_params()
+
+        self.register_buffer('step', torch.zeros(1, dtype=torch.long))
+        self.register_buffer('stop_threshold', torch.tensor(stop_threshold, dtype=torch.float32))
+
+    @property
+    def r(self):
+        return self.decoder.r.item()
+
+    @r.setter
+    def r(self, value):
+        self.decoder.r = self.decoder.r.new_tensor(value, requires_grad=False)
+
+    def forward(self, x, m, generate_gta=False):
+        device = next(self.parameters()).device  # use same device as parameters
+
+        self.step += 1
+
+        if generate_gta:
+            self.eval()
+        else:
+            self.train()
+
+        batch_size, _, steps  = m.size()
+
+        # Initialise all hidden states and pack into tuple
+        attn_hidden = torch.zeros(batch_size, self.decoder_dims, device=device)
+        rnn1_hidden = torch.zeros(batch_size, self.lstm_dims, device=device)
+        rnn2_hidden = torch.zeros(batch_size, self.lstm_dims, device=device)
+        hidden_states = (attn_hidden, rnn1_hidden, rnn2_hidden)
+
+        # Initialise all lstm cell states and pack into tuple
+        rnn1_cell = torch.zeros(batch_size, self.lstm_dims, device=device)
+        rnn2_cell = torch.zeros(batch_size, self.lstm_dims, device=device)
+        cell_states = (rnn1_cell, rnn2_cell)
+
+        # <GO> Frame for start of decoder loop
+        go_frame = torch.zeros(batch_size, self.n_mels, device=device)
+
+        # Need an initial context vector
+        context_vec = torch.zeros(batch_size, self.decoder_dims, device=device)
+
+        # Project the encoder outputs to avoid
+        # unnecessary matmuls in the decoder loop
+        encoder_seq = self.encoder(x)
+        encoder_seq_proj = self.encoder_proj(encoder_seq)
+
+        # Need a couple of lists for outputs
+        mel_outputs, attn_scores = [], []
+
+        # Run the decoder loop
+        for t in range(0, steps, self.r):
+            prenet_in = m[:, :, t - 1] if t > 0 else go_frame
+            mel_frames, scores, hidden_states, cell_states, context_vec = \
+                self.decoder(encoder_seq, encoder_seq_proj, prenet_in,
+                             hidden_states, cell_states, context_vec, t)
+            mel_outputs.append(mel_frames)
+            attn_scores.append(scores)
+
+        # Concat the mel outputs into sequence
+        mel_outputs = torch.cat(mel_outputs, dim=2)
+
+        # Post-Process for Linear Spectrograms
+        postnet_out = self.postnet(mel_outputs)
+        linear = self.post_proj(postnet_out)
+        linear = linear.transpose(1, 2)
+
+        # For easy visualisation
+        attn_scores = torch.cat(attn_scores, 1)
+        # attn_scores = attn_scores.cpu().data.numpy()
+
+        return mel_outputs, linear, attn_scores
+
+    def generate(self, x, steps=2000):
+        self.eval()
+        device = next(self.parameters()).device  # use same device as parameters
+
+        batch_size = 1
+        x = torch.as_tensor(x, dtype=torch.long, device=device).unsqueeze(0)
+
+        # Need to initialise all hidden states and pack into tuple for tidyness
+        attn_hidden = torch.zeros(batch_size, self.decoder_dims, device=device)
+        rnn1_hidden = torch.zeros(batch_size, self.lstm_dims, device=device)
+        rnn2_hidden = torch.zeros(batch_size, self.lstm_dims, device=device)
+        hidden_states = (attn_hidden, rnn1_hidden, rnn2_hidden)
+
+        # Need to initialise all lstm cell states and pack into tuple for tidyness
+        rnn1_cell = torch.zeros(batch_size, self.lstm_dims, device=device)
+        rnn2_cell = torch.zeros(batch_size, self.lstm_dims, device=device)
+        cell_states = (rnn1_cell, rnn2_cell)
+
+        # Need a <GO> Frame for start of decoder loop
+        go_frame = torch.zeros(batch_size, self.n_mels, device=device)
+
+        # Need an initial context vector
+        context_vec = torch.zeros(batch_size, self.decoder_dims, device=device)
+
+        # Project the encoder outputs to avoid
+        # unnecessary matmuls in the decoder loop
+        encoder_seq = self.encoder(x)
+        encoder_seq_proj = self.encoder_proj(encoder_seq)
+
+        # Need a couple of lists for outputs
+        mel_outputs, attn_scores = [], []
+
+        # Run the decoder loop
+        for t in range(0, steps, self.r):
+            prenet_in = mel_outputs[-1][:, :, -1] if t > 0 else go_frame
+            mel_frames, scores, hidden_states, cell_states, context_vec = \
+            self.decoder(encoder_seq, encoder_seq_proj, prenet_in,
+                         hidden_states, cell_states, context_vec, t)
+            mel_outputs.append(mel_frames)
+            attn_scores.append(scores)
+            # Stop the loop if silent frames present
+            if (mel_frames < self.stop_threshold).all() and t > 10: break
+
+        # Concat the mel outputs into sequence
+        mel_outputs = torch.cat(mel_outputs, dim=2)
+
+        # Post-Process for Linear Spectrograms
+        postnet_out = self.postnet(mel_outputs)
+        linear = self.post_proj(postnet_out)
 
 
+        linear = linear.transpose(1, 2)[0].cpu().data.numpy()
+        mel_outputs = mel_outputs[0].cpu().data.numpy()
 
-class Tacotron():
-  def __init__(self, hparams):
-    self._hparams = hparams
+        # For easy visualisation
+        attn_scores = torch.cat(attn_scores, 1)
+        attn_scores = attn_scores.cpu().data.numpy()[0]
 
+        self.train()
 
-  def initialize(self, inputs, input_lengths, mel_targets=None, linear_targets=None):
-    '''Initializes the model for inference.
+        return mel_outputs, linear, attn_scores
 
-    Sets "mel_outputs", "linear_outputs", and "alignments" fields.
+    def init_model(self):
+        for p in self.parameters():
+            if p.dim() > 1: nn.init.xavier_uniform_(p)
 
-    Args:
-      inputs: int32 Tensor with shape [N, T_in] where N is batch size, T_in is number of
-        steps in the input time series, and values are character IDs
-      input_lengths: int32 Tensor with shape [N] where N is batch size and values are the lengths
-        of each sequence in inputs.
-      mel_targets: float32 Tensor with shape [N, T_out, M] where N is batch size, T_out is number
-        of steps in the output time series, M is num_mels, and values are entries in the mel
-        spectrogram. Only needed for training.
-      linear_targets: float32 Tensor with shape [N, T_out, F] where N is batch_size, T_out is number
-        of steps in the output time series, F is num_freq, and values are entries in the linear
-        spectrogram. Only needed for training.
-    '''
-    with tf.variable_scope('inference') as scope:
-      is_training = linear_targets is not None
-      batch_size = tf.shape(inputs)[0]
-      hp = self._hparams
+    def get_step(self):
+        return self.step.data.item()
 
-      # Embeddings
-      embedding_table = tf.get_variable(
-        'embedding', [len(symbols), hp.embed_depth], dtype=tf.float32,
-        initializer=tf.truncated_normal_initializer(stddev=0.5))
-      embedded_inputs = tf.nn.embedding_lookup(embedding_table, inputs)          # [N, T_in, embed_depth=256]
+    def reset_step(self):
+        # assignment to parameters or buffers is overloaded, updates internal dict entry
+        self.step = self.step.data.new_tensor(1)
 
-      # Encoder
-      prenet_outputs = prenet(embedded_inputs, is_training, hp.prenet_depths)    # [N, T_in, prenet_depths[-1]=128]
-      encoder_outputs = encoder_cbhg(prenet_outputs, input_lengths, is_training, # [N, T_in, encoder_depth=256]
-                                     hp.encoder_depth)
+    def log(self, path, msg):
+        with open(path, 'a') as f:
+            print(msg, file=f)
 
-      # Attention
-      attention_cell = AttentionWrapper(
-        GRUCell(hp.attention_depth),
-        BahdanauAttention(hp.attention_depth, encoder_outputs),
-        alignment_history=True,
-        output_attention=False)                                                  # [N, T_in, attention_depth=256]
-      
-      # Apply prenet before concatenation in AttentionWrapper.
-      attention_cell = DecoderPrenetWrapper(attention_cell, is_training, hp.prenet_depths)
+    def load(self, path: Union[str, Path]):
+        # Use device of model params as location for loaded state
+        device = next(self.parameters()).device
+        state_dict = torch.load(path, map_location=device)
 
-      # Concatenate attention context vector and RNN cell output into a 2*attention_depth=512D vector.
-      concat_cell = ConcatOutputAndAttentionWrapper(attention_cell)              # [N, T_in, 2*attention_depth=512]
+        # Backwards compatibility with old saved models
+        if 'r' in state_dict and not 'decoder.r' in state_dict:
+            self.r = state_dict['r']
 
-      # Decoder (layers specified bottom to top):
-      decoder_cell = MultiRNNCell([
-          OutputProjectionWrapper(concat_cell, hp.decoder_depth),
-          ResidualWrapper(GRUCell(hp.decoder_depth)),
-          ResidualWrapper(GRUCell(hp.decoder_depth))
-        ], state_is_tuple=True)                                                  # [N, T_in, decoder_depth=256]
+        self.load_state_dict(state_dict, strict=False)
 
-      # Project onto r mel spectrograms (predict r outputs at each RNN step):
-      output_cell = OutputProjectionWrapper(decoder_cell, hp.num_mels * hp.outputs_per_step)
-      decoder_init_state = output_cell.zero_state(batch_size=batch_size, dtype=tf.float32)
+    def save(self, path: Union[str, Path]):
+        # No optimizer argument because saving a model should not include data
+        # only relevant in the training process - it should only be properties
+        # of the model itself. Let caller take care of saving optimzier state.
+        torch.save(self.state_dict(), path)
 
-      if is_training:
-        helper = TacoTrainingHelper(inputs, mel_targets, hp.num_mels, hp.outputs_per_step)
-      else:
-        helper = TacoTestHelper(batch_size, hp.num_mels, hp.outputs_per_step)
-
-      (decoder_outputs, _), final_decoder_state, _ = tf.contrib.seq2seq.dynamic_decode(
-        BasicDecoder(output_cell, helper, decoder_init_state),
-        maximum_iterations=hp.max_iters)                                         # [N, T_out/r, M*r]
-
-      # Reshape outputs to be one output per entry
-      mel_outputs = tf.reshape(decoder_outputs, [batch_size, -1, hp.num_mels])   # [N, T_out, M]
-
-      # Add post-processing CBHG:
-      post_outputs = post_cbhg(mel_outputs, hp.num_mels, is_training,            # [N, T_out, postnet_depth=256]
-                               hp.postnet_depth)
-      linear_outputs = tf.layers.dense(post_outputs, hp.num_freq)                # [N, T_out, F]
-
-      # Grab alignments from the final decoder state:
-      alignments = tf.transpose(final_decoder_state[0].alignment_history.stack(), [1, 2, 0])
-
-      self.inputs = inputs
-      self.input_lengths = input_lengths
-      self.mel_outputs = mel_outputs
-      self.linear_outputs = linear_outputs
-      self.alignments = alignments
-      self.mel_targets = mel_targets
-      self.linear_targets = linear_targets
-      log('Initialized Tacotron model. Dimensions: ')
-      log('  embedding:               %d' % embedded_inputs.shape[-1])
-      log('  prenet out:              %d' % prenet_outputs.shape[-1])
-      log('  encoder out:             %d' % encoder_outputs.shape[-1])
-      log('  attention out:           %d' % attention_cell.output_size)
-      log('  concat attn & out:       %d' % concat_cell.output_size)
-      log('  decoder cell out:        %d' % decoder_cell.output_size)
-      log('  decoder out (%d frames):  %d' % (hp.outputs_per_step, decoder_outputs.shape[-1]))
-      log('  decoder out (1 frame):   %d' % mel_outputs.shape[-1])
-      log('  postnet out:             %d' % post_outputs.shape[-1])
-      log('  linear out:              %d' % linear_outputs.shape[-1])
-
-
-  def add_loss(self):
-    '''Adds loss to the model. Sets "loss" field. initialize must have been called.'''
-    with tf.variable_scope('loss') as scope:
-      hp = self._hparams
-      self.mel_loss = tf.reduce_mean(tf.abs(self.mel_targets - self.mel_outputs))
-      l1 = tf.abs(self.linear_targets - self.linear_outputs)
-      # Prioritize loss for frequencies under 3000 Hz.
-      n_priority_freq = int(3000 / (hp.sample_rate * 0.5) * hp.num_freq)
-      self.linear_loss = 0.5 * tf.reduce_mean(l1) + 0.5 * tf.reduce_mean(l1[:,:,0:n_priority_freq])
-      self.loss = self.mel_loss + self.linear_loss
-
-
-  def add_optimizer(self, global_step):
-    '''Adds optimizer. Sets "gradients" and "optimize" fields. add_loss must have been called.
-
-    Args:
-      global_step: int32 scalar Tensor representing current global step in training
-    '''
-    with tf.variable_scope('optimizer') as scope:
-      hp = self._hparams
-      if hp.decay_learning_rate:
-        self.learning_rate = _learning_rate_decay(hp.initial_learning_rate, global_step)
-      else:
-        self.learning_rate = tf.convert_to_tensor(hp.initial_learning_rate)
-      optimizer = tf.train.AdamOptimizer(self.learning_rate, hp.adam_beta1, hp.adam_beta2)
-      gradients, variables = zip(*optimizer.compute_gradients(self.loss))
-      self.gradients = gradients
-      clipped_gradients, _ = tf.clip_by_global_norm(gradients, 1.0)
-
-      # Add dependency on UPDATE_OPS; otherwise batchnorm won't work correctly. See:
-      # https://github.com/tensorflow/tensorflow/issues/1122
-      with tf.control_dependencies(tf.get_collection(tf.GraphKeys.UPDATE_OPS)):
-        self.optimize = optimizer.apply_gradients(zip(clipped_gradients, variables),
-          global_step=global_step)
-
-
-def _learning_rate_decay(init_lr, global_step):
-  # Noam scheme from tensor2tensor:
-  warmup_steps = 4000.0
-  step = tf.cast(global_step + 1, dtype=tf.float32)
-  return init_lr * warmup_steps**0.5 * tf.minimum(step * warmup_steps**-1.5, step**-0.5)
+    def num_params(self, print_out=True):
+        parameters = filter(lambda p: p.requires_grad, self.parameters())
+        parameters = sum([np.prod(p.size()) for p in parameters]) / 1_000_000
+        if print_out:
+            print('Trainable Parameters: %.3fM' % parameters)
+        return parameters
